@@ -49,8 +49,11 @@ jobs:
       - name: Add upstream and fetch
         run: |
           git remote add upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git
-          git fetch --tags upstream
-          git fetch --tags origin
+          # --force: upstream is authoritative for its own tags. Without it, a tag
+          # that got created locally under the same name (e.g. by softprops/action-gh-release
+          # on a previous run, pointing at our own commit rather than upstream's) makes the
+          # fetch fail with "would clobber existing tag" and blocks every future sync.
+          git fetch --force --tags upstream
 
       - id: determine
         name: Determine build necessity and sync
