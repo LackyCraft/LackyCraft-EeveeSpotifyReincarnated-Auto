@@ -114,13 +114,21 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install make dpkg ldid wget unzip zip
+          brew install make dpkg ldid wget unzip zip jq
           echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
           python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
           ARCH=$(uname -m)
           if [ "$ARCH" = "x86_64" ]; then SUFFIX=macos-amd64; else SUFFIX=macos-arm64; fi
           sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
           sudo chmod +x /usr/local/bin/ipapatch
+
+      - name: Install ClamAV
+        run: |
+          brew install clamav
+          conf="$(brew --prefix)/etc/clamav/freshclam.conf"
+          [ -f "$conf" ] || cp "${conf}.sample" "$conf"
+          sed -i '' '/^Example/d' "$conf"
+          freshclam || echo "::warning::freshclam failed to update ClamAV definitions; scan may use stale/bundled data"
 
       - id: ipa_source
         name: Determine IPA source
@@ -146,6 +154,20 @@ jobs:
             echo "::error::VANILLA_IPA_URL / ipa_url did not return a valid IPA file (got $file_type). Check the URL is a direct download link, not a webpage."
             exit 1
           fi
+
+      - id: prepatch_scan
+        name: Scan downloaded IPA (pre-patch)
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          mkdir -p reports
+          chmod +x Tools/scan-report.sh
+          set +e
+          ./Tools/scan-report.sh "vanilla IPA (before patch)" reports/prepatch-scan.md spotify.ipa
+          status=$?
+          set -e
+          [ "$status" -eq 2 ] && echo "critical=true" >> "$GITHUB_OUTPUT" || echo "critical=false" >> "$GITHUB_OUTPUT"
 
       - id: ipa_check
         name: Check if vanilla IPA is decrypted
@@ -195,22 +217,47 @@ jobs:
             echo "ipa_included=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Report why IPA was skipped
-        if: steps.ipa_source.outputs.build_ipa == 'true' && steps.ipa_check.outputs.decrypted != 'true'
+      - id: postpatch_scan
+        name: Scan build outputs (post-patch)
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          mkdir -p reports
+          chmod +x Tools/scan-report.sh
+          set +e
+          ./Tools/scan-report.sh "build output (after patch)" reports/postpatch-scan.md output/*
+          status=$?
+          set -e
+          [ "$status" -eq 2 ] && echo "critical=true" >> "$GITHUB_OUTPUT" || echo "critical=false" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
         run: |
           {
-            echo "### IPA не собран"
-            echo "Файл по \`VANILLA_IPA_URL\` (или переданному \`ipa_url\`) зашифрован (FairPlay DRM, \`cryptid=1\`)."
-            echo "Патчинг твика возможен только для уже расшифрованного IPA — эта сборка содержит только \`.deb\`."
-            echo ""
-            echo "Обнови секрет \`VANILLA_IPA_URL\` ссылкой на дешифрованную копию и перезапусти workflow, чтобы получить и IPA."
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "Automated build of EeveeSpotify packages from upstream fork sync."
+            echo
+            if [ "${{ steps.outputs.outputs.ipa_included }}" = "true" ]; then
+              echo "Includes .deb and .ipa."
+            else
+              echo "Only .deb is included - VANILLA_IPA_URL points to an encrypted (FairPlay DRM) IPA, and patching requires an already-decrypted one. Update the secret with a decrypted IPA and re-run the workflow to also get an .ipa."
+            fi
+            echo
+            if [ "${{ steps.prepatch_scan.outputs.critical }}" = "true" ] || [ "${{ steps.postpatch_scan.outputs.critical }}" = "true" ]; then
+              echo "## ⚠️ SECURITY WARNING"
+              echo "Antivirus scanning flagged one or more files in this build as malicious/suspicious."
+              echo "**Do not install until you've reviewed the attached scan reports.**"
+              echo
+            fi
+            echo "Antivirus scan reports (ClamAV + VirusTotal, before and after patching) are attached below."
+          } > release-body.md
+          cat release-body.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build outputs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: EeveeSpotify-build-${{ github.run_id }}
-          path: output/*
+          path: |
+            output/*
+            reports/*.md
           if-no-files-found: error
 
       - name: Publish release with all built files
@@ -218,7 +265,9 @@ jobs:
         with:
           tag_name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('autosync-{0}', github.run_id) }}
           name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('Autosync {0}', github.run_id) }}
-          body: "${{ steps.outputs.outputs.ipa_included == 'true' && 'Automated build of EeveeSpotify packages from upstream fork sync. Includes .deb and .ipa.' || 'Automated build of EeveeSpotify packages from upstream fork sync. Only .deb is included - VANILLA_IPA_URL points to an encrypted (FairPlay DRM) IPA, and patching requires an already-decrypted one. Update the secret with a decrypted IPA and re-run the workflow to also get an .ipa.' }}"
+          body_path: release-body.md
           draft: false
           prerelease: false
-          files: output/*
+          files: |
+            output/*
+            reports/*.md
