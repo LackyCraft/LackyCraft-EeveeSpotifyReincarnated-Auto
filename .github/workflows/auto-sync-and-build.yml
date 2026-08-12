@@ -139,21 +139,45 @@ jobs:
         if: steps.ipa_source.outputs.build_ipa == 'true'
         env:
           IPA_URL: ${{ steps.ipa_source.outputs.url }}
-        run: curl -fsSL "$IPA_URL" -o spotify.ipa
+        run: |
+          curl -fsSL "$IPA_URL" -o spotify.ipa
+          file_type=$(file --mime-type -b spotify.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::VANILLA_IPA_URL / ipa_url did not return a valid IPA file (got $file_type). Check the URL is a direct download link, not a webpage."
+            exit 1
+          fi
+
+      - id: ipa_check
+        name: Check if vanilla IPA is decrypted
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        run: |
+          rm -rf ipa_check && mkdir -p ipa_check
+          unzip -q spotify.ipa -d ipa_check
+          APP_DIR=$(find ipa_check/Payload -maxdepth 1 -name '*.app' | head -n1)
+          EXEC_NAME=$(plutil -extract CFBundleExecutable raw "$APP_DIR/Info.plist")
+          CRYPTID=$(otool -l "$APP_DIR/$EXEC_NAME" | awk '/LC_ENCRYPTION_INFO/{f=1} f && /cryptid/{print $2; exit}')
+          rm -rf ipa_check
+          echo "IPA cryptid: ${CRYPTID:-unknown}"
+          if [ "$CRYPTID" = "0" ]; then
+            echo "decrypted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "decrypted=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build DEB + IPA
-        if: steps.ipa_source.outputs.build_ipa == 'true'
+        if: steps.ipa_source.outputs.build_ipa == 'true' && steps.ipa_check.outputs.decrypted == 'true'
         run: |
           chmod +x ./build-ipa-local.sh
           ./build-ipa-local.sh spotify.ipa
 
-      - name: Build DEB only (no IPA source configured)
-        if: steps.ipa_source.outputs.build_ipa != 'true'
+      - name: Build DEB only (no usable IPA source)
+        if: steps.ipa_source.outputs.build_ipa != 'true' || steps.ipa_check.outputs.decrypted != 'true'
         run: |
           make build-eeveeswiftprotobuf
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
 
-      - name: Collect build outputs
+      - id: outputs
+        name: Collect build outputs
         run: |
           mkdir -p output
           deb=$(find packages -maxdepth 1 -name '*.deb' | head -n1)
@@ -165,6 +189,22 @@ jobs:
             echo "::error::No build artifacts were produced (neither .deb nor .ipa)"
             exit 1
           fi
+          if [ -n "$ipa" ]; then
+            echo "ipa_included=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ipa_included=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report why IPA was skipped
+        if: steps.ipa_source.outputs.build_ipa == 'true' && steps.ipa_check.outputs.decrypted != 'true'
+        run: |
+          {
+            echo "### IPA не собран"
+            echo "Файл по \`VANILLA_IPA_URL\` (или переданному \`ipa_url\`) зашифрован (FairPlay DRM, \`cryptid=1\`)."
+            echo "Патчинг твика возможен только для уже расшифрованного IPA — эта сборка содержит только \`.deb\`."
+            echo ""
+            echo "Обнови секрет \`VANILLA_IPA_URL\` ссылкой на дешифрованную копию и перезапусти workflow, чтобы получить и IPA."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build outputs as workflow artifact
         uses: actions/upload-artifact@v4
@@ -178,7 +218,7 @@ jobs:
         with:
           tag_name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('autosync-{0}', github.run_id) }}
           name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('Autosync {0}', github.run_id) }}
-          body: Automated build of EeveeSpotify packages from upstream fork sync.
+          body: "${{ steps.outputs.outputs.ipa_included == 'true' && 'Automated build of EeveeSpotify packages from upstream fork sync. Includes .deb and .ipa.' || 'Automated build of EeveeSpotify packages from upstream fork sync. Only .deb is included - VANILLA_IPA_URL points to an encrypted (FairPlay DRM) IPA, and patching requires an already-decrypted one. Update the secret with a decrypted IPA and re-run the workflow to also get an .ipa.' }}"
           draft: false
           prerelease: false
           files: output/*
