@@ -1,0 +1,26 @@
+name: CI Minimal Test
+
+on:
+  push:
+    paths:
+      - '.github/ci-trigger.txt'
+  workflow_dispatch: {}
+
+jobs:
+  minimal-test:
+    name: Minimal Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Create run-info
+        run: |
+          echo "Minimal workflow run at: $(date)" > run-info.txt
+          echo "Repository: $GITHUB_REPOSITORY" >> run-info.txt
+
+      - name: Upload run info
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-info
+          path: run-info.txt
