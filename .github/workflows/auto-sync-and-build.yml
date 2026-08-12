@@ -101,16 +101,16 @@ jobs:
           echo "deb_name=$(basename "$DEB_PATH")" >> $GITHUB_OUTPUT
       - name: Create or update release
         id: release
-        uses: peter-evans/create-or-update-release@v4
+        uses: actions/create-release@v1
         with:
           tag_name: ${{ needs.sync.outputs.tag_name }}
-          name: ${{ needs.sync.outputs.tag_name }}
-          draft: false
-          prerelease: false
+          release_name: ${{ needs.sync.outputs.tag_name }}
           body: |
             Automated build of EeveeSpotify packages from upstream fork sync.
+          draft: false
+          prerelease: false
       - name: Upload DEB to release
-        uses: peter-evans/upload-release-asset@v3
+        uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
           asset_path: ${{ steps.package.outputs.deb_path }}
