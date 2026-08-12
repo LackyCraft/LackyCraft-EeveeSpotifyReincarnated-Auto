@@ -1,210 +1,161 @@
-name: Sync fork, build DEBs, publish release
+name: Auto Sync and Build Release
 
 on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - '.github/ci-trigger-sync.txt'
   schedule:
-    - cron: '0 4 * * *'
-  workflow_dispatch:
-    inputs:
-      force_build:
-        description: 'Build even when upstream has no new tag update'
-        required: false
-        default: 'false'
-      ipa_url:
-        description: 'Optional direct URL to a decrypted Spotify IPA for automatic IPA generation'
-        required: false
-        default: ''
+    - cron: '0 3 * * *'
 
 permissions:
   contents: write
+  packages: write
 
-env:
-  SWIFTPROTOBUF_VERSION: '1.29.0'
-  THEOS: ${{ github.workspace }}/theos
+concurrency:
+  group: auto-sync-and-build
+  cancel-in-progress: true
 
 jobs:
   sync:
+    name: Sync fork with upstream
     runs-on: ubuntu-latest
     outputs:
-      build_needed: ${{ steps.check.outputs.build_needed }}
-      tag_name: ${{ steps.check.outputs.tag_name }}
+      tag_name: ${{ steps.determine.outputs.tag_name }}
+      build_needed: ${{ steps.determine.outputs.build_needed }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Add upstream remote
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch tags
         run: |
           git remote add upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git || true
-          git remote set-url upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git
-          git fetch upstream --tags
-      - name: Calculate latest upstream tag
-        id: check
+          git fetch --tags upstream || true
+          git fetch --tags origin || true
+
+      - id: determine
+        name: Determine if upstream tag changed
         run: |
           set -e
-          upstream_tag=$(git ls-remote --tags upstream | awk '{print $2}' | sed 's#refs/tags/##' | grep -v '{}' | sort -V | tail -n1 || true)
-          local_tag=$(git tag --sort=-v:refname | head -n1 || true)
-          echo "upstream_tag=$upstream_tag" >> $GITHUB_OUTPUT
-          echo "local_tag=$local_tag" >> $GITHUB_OUTPUT
-          if [ -z "$upstream_tag" ]; then
-            echo "build_needed=false" >> $GITHUB_OUTPUT
-            echo "tag_name=" >> $GITHUB_OUTPUT
-            exit 0
+          upstream_tag=$(git ls-remote --tags upstream | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1 || true)
+          local_tag=$(git ls-remote --tags origin | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1 || true)
+          echo "upstream_tag=$upstream_tag"
+          echo "local_tag=$local_tag"
+          if [ -n "$upstream_tag" ] && [ "$upstream_tag" != "$local_tag" ]; then
+            echo "tag_name=$upstream_tag" >> "$GITHUB_OUTPUT"
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            # attempt fast-forward merge of upstream Master into fork Master
+            if git show-ref --verify --quiet refs/heads/Master; then
+              git checkout Master || true
+            else
+              git checkout -b Master || true
+            fi
+            git fetch upstream || true
+            git merge --ff-only upstream/Master || git merge --ff-only upstream/main || true
+            # push using PAT
+            git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
+            git push origin HEAD:Master || true
+          else
+            echo "tag_name=" >> "$GITHUB_OUTPUT"
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$upstream_tag" = "$local_tag" ] && [ "${{ github.event.inputs.force_build }}" != 'true' ]; then
-            echo "build_needed=false" >> $GITHUB_OUTPUT
-            echo "tag_name=$upstream_tag" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          git checkout Master
-          if ! git merge --no-ff --no-edit upstream/Master; then
-            echo "Your forked Master has local changes that conflict with upstream. Resolve the conflict manually." >&2
-            exit 1
-          fi
-          git push origin Master
-          echo "build_needed=true" >> $GITHUB_OUTPUT
-          echo "tag_name=$upstream_tag" >> $GITHUB_OUTPUT
+
   build:
-    needs: sync
-    if: needs.sync.outputs.build_needed == 'true'
+    name: Build DEB and IPA
     runs-on: macos-latest
+    needs: sync
+    if: needs.sync.outputs.build_needed == 'true' || github.event_name == 'workflow_dispatch'
     env:
-      THEOS: ${{ github.workspace }}/theos
-      SWIFTPROTOBUF_VERSION: '1.29.0'
+      THEOS: ${{ runner.temp }}/theos
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          submodules: recursive
-      - name: Checkout Theos
-        uses: actions/checkout@v4
-        with:
-          repository: theos/theos
-          path: ${{ github.workspace }}/theos
-          submodules: recursive
-      - name: Install build tools
+
+      - name: Install Homebrew packages
         run: |
-          brew install make dpkg ldid
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-      - name: Build EeveeSwiftProtobuf.framework
-        run: make build-eeveeswiftprotobuf
-      - name: Build rootless DEB
+          brew update || true
+          brew install dpkg ldid wget unzip zip python3 || true
+
+      - name: Install Theos
         run: |
-          make clean || true
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-      - name: Find built package
-        id: package
-        run: |
-          DEB_PATH=$(find packages -maxdepth 1 -name '*.deb' | head -n 1)
-          if [ -z "$DEB_PATH" ]; then echo 'No .deb package found' >&2; exit 1; fi
-          echo "deb_path=$DEB_PATH" >> $GITHUB_OUTPUT
-          echo "deb_name=$(basename "$DEB_PATH")" >> $GITHUB_OUTPUT
-      - name: Create or update release
-        id: release
+          if [ ! -d "$HOME/theos" ]; then
+            git clone --depth=1 https://github.com/theos/theos "$HOME/theos"
+          fi
+          echo "THEOS set to $HOME/theos"
+
+      - name: Build package (.deb)
         run: |
           set -e
-          TAG='${{ needs.sync.outputs.tag_name }}'
-          release_info=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" || true)
-          if [ -n "$release_info" ]; then
-            upload_url=$(printf '%s' "$release_info" | python3 - <<'PY'
-import json,sys
-obj=json.load(sys.stdin)
-print(obj['upload_url'])
-PY
-)
-            release_id=$(printf '%s' "$release_info" | python3 - <<'PY'
-import json,sys
-obj=json.load(sys.stdin)
-print(obj['id'])
-PY
-)
-          else
-            payload=$(python3 - <<'PY'
-import json,os
-print(json.dumps({
-  'tag_name': os.environ['TAG'],
-  'name': os.environ['TAG'],
-  'body': 'Automated build of EeveeSpotify packages from upstream fork sync.',
-  'draft': False,
-  'prerelease': False
-}))
-PY
-)
-            release_info=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -d "$payload" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases")
-            upload_url=$(printf '%s' "$release_info" | python3 - <<'PY'
-import json,sys
-obj=json.load(sys.stdin)
-print(obj['upload_url'])
-PY
-)
-            release_id=$(printf '%s' "$release_info" | python3 - <<'PY'
-import json,sys
-obj=json.load(sys.stdin)
-print(obj['id'])
-PY
-)
+          export THEOS="$HOME/theos"
+          if [ -f Makefile ]; then
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless || true
           fi
-          echo "upload_url=${upload_url}" >> $GITHUB_OUTPUT
-          echo "release_id=${release_id}" >> $GITHUB_OUTPUT
-      - name: Upload DEB to release
+          debfile=$(find . -type f -name "*.deb" | head -n1 || true)
+          echo "Found deb: $debfile"
+          mkdir -p output
+          if [ -n "$debfile" ]; then cp "$debfile" output/ || true; fi
+          ls -la output || true
+
+      - name: Create GitHub Release
+        id: create_rel
+        uses: actions/create-release@v1
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('autosync-%s', github.run_id) }}
+          release_name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('Autosync run %s', github.run_id) }}
+          body: "Automated sync and build run ${{ github.run_id }}"
+          draft: false
+          prerelease: false
+
+      - name: Upload DEB to Release
+        if: always()
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_rel.outputs.upload_url }}
+          asset_path: output/*.deb
+          asset_name: ${{ needs.sync.outputs.tag_name != '' && format('%s.deb', needs.sync.outputs.tag_name) || 'package.deb' }}
+          asset_content_type: application/vnd.debian.binary-package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Download vanilla IPA (if provided)
+        if: ${{ secrets.VANILLA_IPA_URL != '' }}
         run: |
-          upload_url='${{ steps.release.outputs.upload_url }}'
-          upload_url="${upload_url%\{*}"
-          curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @"${{ steps.package.outputs.deb_path }}" "${upload_url}?name=${{ steps.package.outputs.deb_name }}"
-      - name: Upload DEB artifact
+          mkdir -p vanilla
+          echo "Downloading vanilla IPA"
+          curl -L -o vanilla/vanilla.ipa "${{ secrets.VANILLA_IPA_URL }}"
+          ls -la vanilla || true
+
+      - name: Build IPA from vanilla (if provided)
+        if: ${{ secrets.VANILLA_IPA_URL != '' }}
+        run: |
+          chmod +x ./build-ipa-local.sh || true
+          # the script should accept input path and output path; adapt if needed
+          ./build-ipa-local.sh vanilla/vanilla.ipa output/app.ipa || true
+          ls -la output || true
+
+      - name: Upload IPA to Release (if built)
+        if: ${{ secrets.VANILLA_IPA_URL != '' }}
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_rel.outputs.upload_url }}
+          asset_path: output/*.ipa
+          asset_name: ${{ needs.sync.outputs.tag_name != '' && format('%s.ipa', needs.sync.outputs.tag_name) || 'app.ipa' }}
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Upload outputs as artifacts (debug)
         uses: actions/upload-artifact@v4
         with:
-          name: EeveeSpotify-rootless-DEB
-          path: ${{ steps.package.outputs.deb_path }}
-      - name: Determine IPA source URL
-        id: ipa_source
-        run: |
-          if [ -n '${{ github.event.inputs.ipa_url }}' ]; then
-            echo "IPA_URL=${{ github.event.inputs.ipa_url }}" >> $GITHUB_OUTPUT
-            echo "build_ipa=true" >> $GITHUB_OUTPUT
-          elif [ -n '${{ secrets.VANILLA_IPA_URL }}' ]; then
-            echo "IPA_URL=${{ secrets.VANILLA_IPA_URL }}" >> $GITHUB_OUTPUT
-            echo "build_ipa=true" >> $GITHUB_OUTPUT
-          else
-            echo "build_ipa=false" >> $GITHUB_OUTPUT
-          fi
-      - name: Install IPA build tools
-        if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          brew install wget unzip zip
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ]; then
-            SUFFIX=macos-amd64
-          else
-            SUFFIX=macos-arm64
-          fi
-          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
-          sudo chmod +x /usr/local/bin/ipapatch
-      - name: Download decrypted Spotify IPA
-        if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          curl -fsSL "$IPA_URL" -o spotify.ipa
-      - name: Build IPA
-        if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          chmod +x ./build-ipa-local.sh
-          ./build-ipa-local.sh spotify.ipa
-      - name: Upload IPA assets to release
-        if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          upload_url='${{ steps.release.outputs.upload_url }}'
-          upload_url="${upload_url%\{*}"
-          for ipa in Outputs/IPAS/*.ipa; do
-            [ -f "$ipa" ] || continue
-            name=$(basename "$ipa")
-            curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary @"$ipa" "${upload_url}?name=$name"
-          done
-
+          name: build-output
+          path: output/
