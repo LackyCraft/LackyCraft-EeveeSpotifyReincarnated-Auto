@@ -146,21 +146,28 @@ jobs:
             echo "build_ipa=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download vanilla IPA
+      - id: download_ipa
+        name: Download vanilla IPA
         if: steps.ipa_source.outputs.build_ipa == 'true'
         env:
           IPA_URL: ${{ steps.ipa_source.outputs.url }}
         run: |
-          curl -fsSL "$IPA_URL" -o spotify.ipa
+          if ! curl -fsSL "$IPA_URL" -o spotify.ipa; then
+            echo "::error::Failed to download from VANILLA_IPA_URL / ipa_url."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           file_type=$(file --mime-type -b spotify.ipa)
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
-            echo "::error::VANILLA_IPA_URL / ipa_url did not return a valid IPA file (got $file_type). Check the URL is a direct download link, not a webpage."
-            exit 1
+            echo "::error::VANILLA_IPA_URL / ipa_url did not return a valid IPA file (got $file_type). Check the URL is a direct download link, not a webpage, and that it hasn't expired."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "valid=true" >> "$GITHUB_OUTPUT"
 
       - id: prepatch_scan
         name: Scan downloaded IPA (pre-patch)
-        if: steps.ipa_source.outputs.build_ipa == 'true'
+        if: steps.download_ipa.outputs.valid == 'true'
         env:
           VT_API_KEY: ${{ secrets.VT_API_KEY }}
         run: |
@@ -174,7 +181,7 @@ jobs:
 
       - id: ipa_check
         name: Check if vanilla IPA is decrypted
-        if: steps.ipa_source.outputs.build_ipa == 'true'
+        if: steps.download_ipa.outputs.valid == 'true'
         run: |
           rm -rf ipa_check && mkdir -p ipa_check
           unzip -q spotify.ipa -d ipa_check
@@ -189,14 +196,28 @@ jobs:
             echo "decrypted=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - id: ipa_status
+        name: Determine final IPA usability
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        run: |
+          if [ "${{ steps.download_ipa.outputs.valid }}" != 'true' ]; then
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+            echo "reason=VANILLA_IPA_URL / ipa_url did not return a valid IPA file (bad or expired link)." >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.ipa_check.outputs.decrypted }}" != 'true' ]; then
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+            echo "reason=The IPA is encrypted (FairPlay DRM) - patching requires an already-decrypted IPA." >> "$GITHUB_OUTPUT"
+          else
+            echo "usable=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build DEB + IPA
-        if: steps.ipa_source.outputs.build_ipa == 'true' && steps.ipa_check.outputs.decrypted == 'true'
+        if: steps.ipa_status.outputs.usable == 'true'
         run: |
           chmod +x ./build-ipa-local.sh
           ./build-ipa-local.sh spotify.ipa
 
       - name: Build DEB only (no usable IPA source)
-        if: steps.ipa_source.outputs.build_ipa != 'true' || steps.ipa_check.outputs.decrypted != 'true'
+        if: steps.ipa_source.outputs.build_ipa != 'true' || steps.ipa_status.outputs.usable != 'true'
         run: |
           make build-eeveeswiftprotobuf
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
@@ -240,8 +261,11 @@ jobs:
             echo
             if [ "${{ steps.outputs.outputs.ipa_included }}" = "true" ]; then
               echo "Includes .deb and .ipa."
+            elif [ "${{ steps.ipa_source.outputs.build_ipa }}" = "true" ]; then
+              echo "Only .deb is included - ${{ steps.ipa_status.outputs.reason }}"
+              echo "Update the VANILLA_IPA_URL secret (or pass ipa_url) and re-run the workflow to also get an .ipa."
             else
-              echo "Only .deb is included - VANILLA_IPA_URL points to an encrypted (FairPlay DRM) IPA, and patching requires an already-decrypted one. Update the secret with a decrypted IPA and re-run the workflow to also get an .ipa."
+              echo "Only .deb is included - no VANILLA_IPA_URL secret (or ipa_url input) was configured."
             fi
             echo
             if [ "${{ steps.prepatch_scan.outputs.critical }}" = "true" ] || [ "${{ steps.postpatch_scan.outputs.critical }}" = "true" ]; then
