@@ -1,0 +1,159 @@
+name: Debug - IPA signing variants (test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct URL to a decrypted Spotify IPA (defaults to the VANILLA_IPA_URL secret)'
+        required: false
+        default: ''
+
+env:
+  SWIFTPROTOBUF_VERSION: '1.29.0'
+  THEOS: ${{ github.workspace }}/theos
+
+jobs:
+  build-variants:
+    name: Build signing-hypothesis variants
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout Theos
+        uses: actions/checkout@v5
+        with:
+          repository: theos/theos
+          path: ${{ github.workspace }}/theos
+          submodules: recursive
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3.0'
+
+      - name: Install build tools
+        run: |
+          brew install make dpkg ldid wget unzip zip
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then SUFFIX=macos-amd64; else SUFFIX=macos-arm64; fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+
+      - id: ipa_source
+        name: Determine IPA source
+        run: |
+          if [ -n "${{ github.event.inputs.ipa_url }}" ]; then
+            echo "url=${{ github.event.inputs.ipa_url }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${{ secrets.VANILLA_IPA_URL }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download vanilla IPA
+        env:
+          IPA_URL: ${{ steps.ipa_source.outputs.url }}
+        run: |
+          curl -fsSL "$IPA_URL" -o spotify.ipa
+          file_type=$(file --mime-type -b spotify.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::IPA source did not return a valid IPA (got $file_type)"
+            exit 1
+          fi
+
+      - name: Build EeveeSwiftProtobuf.framework
+        run: |
+          chmod +x Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
+          Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
+
+      - name: theos make package
+        run: |
+          THEOS_PACKAGE_SCHEME=rootless make package FINALPACKAGE=1
+          DEB_FILE=$(ls -t packages/com.eevee.spotify_*.deb | head -1)
+          echo "DEB_FILE=$DEB_FILE" >> "$GITHUB_ENV"
+
+      - name: Build zxPluginsInject.dylib
+        run: |
+          chmod +x Tools/build-zxpi.sh
+          Tools/build-zxpi.sh
+
+      - name: Extract deb + base cyan inject (shared by all variants)
+        run: |
+          mkdir -p variants
+          DEB_EXTRACT="$RUNNER_TEMP/deb-extract"
+          rm -rf "$DEB_EXTRACT"; mkdir -p "$DEB_EXTRACT"
+          dpkg-deb -R "$DEB_FILE" "$DEB_EXTRACT"
+          DYLIB_SRC=$(find "$DEB_EXTRACT" -name 'EeveeSpotify.dylib' | head -1)
+          BUNDLE_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSpotify.bundle' | head -1)
+          FRAMEWORK_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSwiftProtobuf.framework' | head -1)
+          cyan -i spotify.ipa -o variants/base.ipa -f "$DYLIB_SRC" "$FRAMEWORK_SRC" "$BUNDLE_SRC" -c 9 -m 15.0 -du
+
+      - name: "Variant 1: cyan only, no ipapatch (isolates whether ipapatch's LC-inject is the trigger)"
+        run: cp variants/base.ipa "variants/EeveeSpotify-v1-cyan-only.ipa"
+
+      - name: "Variant 2: cyan + ipapatch (current production pipeline, baseline)"
+        run: |
+          cp variants/base.ipa variants/v2.ipa
+          ipapatch --input variants/v2.ipa --inplace --noconfirm --dylib packages/zxPluginsInject.dylib
+          cp variants/v2.ipa "variants/EeveeSpotify-v2-current-pipeline.ipa"
+
+      - name: "Variant 3: cyan + ipapatch + explicit re-sign with preserved entitlements"
+        run: |
+          cp variants/v2.ipa variants/v3.ipa
+          cd variants
+          rm -rf Payload
+          unzip -q v3.ipa
+          APP_DIR=$(find Payload -maxdepth 1 -name '*.app' | head -n1)
+          EXEC_NAME=$(plutil -extract CFBundleExecutable raw "$APP_DIR/Info.plist")
+          resign() {
+            local bin="$1"
+            [ -f "$bin" ] || return 0
+            if ldid -e "$bin" > /tmp/ent.plist 2>/dev/null && [ -s /tmp/ent.plist ]; then
+              ldid -S/tmp/ent.plist "$bin"
+            else
+              ldid -S "$bin"
+            fi
+          }
+          resign "$APP_DIR/$EXEC_NAME"
+          for appex in "$APP_DIR"/PlugIns/*.appex; do
+            [ -d "$appex" ] || continue
+            aname=$(basename "$appex" .appex)
+            resign "$appex/$aname"
+          done
+          rm -f v3-resigned.ipa
+          zip -qry v3-resigned.ipa Payload
+          rm -rf Payload
+          cd ..
+          cp variants/v3-resigned.ipa "variants/EeveeSpotify-v3-explicit-resign.ipa"
+
+      - name: "Variant 4: cyan + ipapatch + repack with ditto (community 'Feather-style' workaround)"
+        run: |
+          cp variants/v2.ipa variants/v4.ipa
+          cd variants
+          rm -rf Payload
+          unzip -q v4.ipa
+          rm -f v4-ditto.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload v4-ditto.ipa
+          rm -rf Payload
+          cd ..
+          cp variants/v4-ditto.ipa "variants/EeveeSpotify-v4-ditto-repack.ipa"
+
+      - name: "Variant 5: current pipeline, plain filename (tests the -patched/naming hypothesis)"
+        run: cp variants/v2.ipa "variants/EeveeSpotify.ipa"
+
+      - name: Clean up intermediate files
+        run: |
+          cd variants
+          rm -f base.ipa v2.ipa v3.ipa v3-resigned.ipa v4.ipa v4-ditto.ipa
+          ls -la
+
+      - name: Upload all variants as one artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-signing-test-variants-${{ github.run_id }}
+          path: variants/*.ipa
+          retention-days: 7
+          if-no-files-found: error
