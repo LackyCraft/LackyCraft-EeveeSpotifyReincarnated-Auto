@@ -1,0 +1,2 @@
+Triggered by assistant at 2026-08-12T10:44:48Z
+This file exists to trigger the minimal CI workflow on push.
