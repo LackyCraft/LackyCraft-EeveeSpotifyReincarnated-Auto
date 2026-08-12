@@ -92,15 +92,50 @@ jobs:
           cyan -i spotify.ipa -o variants/base.ipa -f "$DYLIB_SRC" "$FRAMEWORK_SRC" "$BUNDLE_SRC" -c 9 -m 15.0 -du
 
       - name: "Variant 1: cyan only, no ipapatch (isolates whether ipapatch's LC-inject is the trigger)"
+        continue-on-error: true
         run: cp variants/base.ipa "variants/EeveeSpotify-v1-cyan-only.ipa"
 
       - name: "Variant 2: cyan + ipapatch (current production pipeline, baseline)"
+        continue-on-error: true
         run: |
           cp variants/base.ipa variants/v2.ipa
           ipapatch --input variants/v2.ipa --inplace --noconfirm --dylib packages/zxPluginsInject.dylib
           cp variants/v2.ipa "variants/EeveeSpotify-v2-current-pipeline.ipa"
 
+      - name: Diagnose Mach-O / code signature at each stage (no phone needed)
+        continue-on-error: true
+        run: |
+          diagnose() {
+            local label="$1"
+            local ipa="$2"
+            echo "=================== $label ($ipa) ==================="
+            if [ ! -f "$ipa" ]; then echo "(missing, skipping)"; return 0; fi
+            rm -rf diag_extract
+            mkdir -p diag_extract
+            unzip -q "$ipa" -d diag_extract
+            APP_DIR=$(find diag_extract/Payload -maxdepth 1 -name '*.app' | head -n1)
+            EXEC_NAME=$(plutil -extract CFBundleExecutable raw "$APP_DIR/Info.plist")
+            BIN="$APP_DIR/$EXEC_NAME"
+            echo "--- file size ---"
+            ls -la "$BIN"
+            echo "--- otool -l: LC_CODE_SIGNATURE / LC_SYMTAB ---"
+            otool -l "$BIN" | grep -A4 "LC_CODE_SIGNATURE\|LC_SYMTAB" || echo "(not found)"
+            echo "--- ldid -e (read existing entitlements/signature) ---"
+            set +e
+            ldid -e "$BIN" > /tmp/diag_ent.plist 2>/tmp/diag_ent.err
+            rc=$?
+            set -e
+            echo "ldid -e exit code: $rc"
+            echo "stderr: $(cat /tmp/diag_ent.err)"
+            echo "stdout (first 300 bytes): $(head -c 300 /tmp/diag_ent.plist)"
+            echo
+          }
+          diagnose "0: vanilla, before any processing" spotify.ipa
+          diagnose "1: cyan only" variants/base.ipa
+          diagnose "2: cyan + ipapatch" variants/v2.ipa
+
       - name: "Variant 3: cyan + ipapatch + explicit re-sign with preserved entitlements"
+        continue-on-error: true
         run: |
           cp variants/v2.ipa variants/v3.ipa
           cd variants
@@ -130,6 +165,7 @@ jobs:
           cp variants/v3-resigned.ipa "variants/EeveeSpotify-v3-explicit-resign.ipa"
 
       - name: "Variant 4: cyan + ipapatch + repack with ditto (community 'Feather-style' workaround)"
+        continue-on-error: true
         run: |
           cp variants/v2.ipa variants/v4.ipa
           cd variants
@@ -142,18 +178,21 @@ jobs:
           cp variants/v4-ditto.ipa "variants/EeveeSpotify-v4-ditto-repack.ipa"
 
       - name: "Variant 5: current pipeline, plain filename (tests the -patched/naming hypothesis)"
+        continue-on-error: true
         run: cp variants/v2.ipa "variants/EeveeSpotify.ipa"
 
       - name: Clean up intermediate files
+        if: always()
         run: |
           cd variants
           rm -f base.ipa v2.ipa v3.ipa v3-resigned.ipa v4.ipa v4-ditto.ipa
           ls -la
 
       - name: Upload all variants as one artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ipa-signing-test-variants-${{ github.run_id }}
           path: variants/*.ipa
           retention-days: 7
-          if-no-files-found: error
+          if-no-files-found: warn
