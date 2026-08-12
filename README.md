@@ -43,6 +43,20 @@ This tweak makes Spotify think you have a Premium subscription, granting free li
   </ol>
 </details>
 
+## Автоматическое обновление и CI/CD
+
+В этом форке можно настроить автоматическое обновление и сборку без ручного запуска каждого шага.
+
+1. Добавьте в ваш форк два workflow файла:
+   - `.github/workflows/auto-sync-and-build.yml` — синхронизирует `Master` с upstream, собирает `.deb` и создает GitHub Release на последнем теге; если задан секрет `VANILLA_IPA_URL` или input `ipa_url`, то этот workflow также соберет IPA и прикрепит его к релизу.
+   - `.github/workflows/auto-build-ipa.yml` — ручный fallback для пересборки IPA из существующего Release тега, если вам нужно перезапустить только IPA-часть.
+2. В настройках репозитория GitHub перейдите в `Settings` → `Secrets and variables` → `Actions` и добавьте секрет `VANILLA_IPA_URL` с прямой ссылкой на ваш собственный исходный Spotify IPA.
+3. Убедитесь, что в `Actions` включены разрешения `Read and Write` для токена действий.
+4. При каждом новом теге у upstream репозитория workflow будет обновлять ваш форк, собирать пакет и публиковать его в Release.
+5. IPA-файл может собираться автоматически сразу после создания релиза, если `VANILLA_IPA_URL` задан.
+
+> Важно: исходный Spotify IPA нельзя хранить в репозитории. GitHub workflow должен загружать его по прямой ссылке из вашего собственного хранилища.
+
 ## The History
 
 In January 2024, Spotilife, the only tweak to get Spotify Premium, stopped working on new Spotify versions. [whoeevee](https://github.com/whoeevee) decompiled Spotilife, reverse-engineered Spotify, intercepted requests, etc., and created this tweak.
@@ -61,7 +75,7 @@ Please refrain from opening issues about the following features, as they are ser
 - Native playlist downloading (you can download podcast episodes though)
 - Jam (hosting a Spotify Jam and joining it remotely requires Premium; only joining in-person works)
 - AI DJ/Playlist
-- Spotify Connect (When using Spotify Connect, the device will act as a remote control and stream directly to the connected device. This is a server-sided limitation and is beyond the control of EeveeSpotify, so it will behave as if you have a Free subscription while using this feature.)
+- Spotify Connect (When using Spotify Connect, the device will act as a remote control and stream directly to Spotify, so it will behave as if you have a Free subscription.)
 
 ## [Common Issues](https://github.com/jaydenjcpy/EeveeSpotifyReincarnated/blob/Master/common_issues.md)
 Please check out the hyperlink above before opening an issue
@@ -94,6 +108,7 @@ For sideloaded IPAs, we recommend using **SideStore** or certificate-based signi
 To open Spotify links in sideloaded app, use [OpenSpotifySafariExtension](https://github.com/BillyCurtis/OpenSpotifySafariExtension). Remember to activate it and allow access in Settings > Safari > Extensions.
 
 ## Credits
+
 Thanks for all of the community's support, also, thanks to all the devs who worked along with me to revive this project Go check the other dev's out:
 
 [Ryuk](https://github.com/faroukbmiled) 

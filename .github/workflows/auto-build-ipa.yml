@@ -1,0 +1,120 @@
+name: Build IPA from release DEB
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build the IPA from'
+        required: true
+        default: ''
+      ipa_url:
+        description: 'Direct URL to a decrypted Spotify IPA'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: ${{ github.workspace }}/theos
+          submodules: recursive
+      - name: Install build tools
+        run: |
+          brew install make dpkg ldid wget unzip zip
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            SUFFIX=macos-amd64
+          else
+            SUFFIX=macos-arm64
+          fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+      - name: Determine IPA source URL
+        id: ipa_source
+        run: |
+          if [ -n "${{ github.event.inputs.ipa_url }}" ]; then
+            echo "IPA_URL=${{ github.event.inputs.ipa_url }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ secrets.VANILLA_IPA_URL }}" ]; then
+            echo "IPA_URL=${{ secrets.VANILLA_IPA_URL }}" >> $GITHUB_OUTPUT
+          else
+            echo "ipa_url not provided and VANILLA_IPA_URL secret missing" >&2
+            exit 1
+          fi
+      - name: Download decrypted Spotify IPA
+        run: |
+          curl -fsSL "$IPA_URL" -o spotify.ipa
+      - name: Determine release ID and upload URL
+        id: release_info
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" = "release" ]; then
+            upload_url='${{ github.event.release.upload_url }}'
+            release_id='${{ github.event.release.id }}'
+          else
+            tag='${{ github.event.inputs.tag }}'
+            if [ -z "$tag" ]; then
+              echo "tag is required for manual workflow_dispatch runs" >&2
+              exit 1
+            fi
+            release_info=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag")
+            upload_url=$(echo "$release_info" | python3 -c 'import sys,json; print(json.load(sys.stdin)["upload_url"])')
+            release_id=$(echo "$release_info" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          fi
+          upload_url="${upload_url%\{*}"
+          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
+          echo "release_id=$release_id" >> $GITHUB_OUTPUT
+      - name: Download DEB asset from release
+        run: |
+          release_id=${{ steps.release_info.outputs.release_id }}
+          asset_id=$(curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets" | \
+            python3 - <<'PY'
+              import json,sys
+              assets=json.load(sys.stdin)
+              for asset in assets:
+                  if asset['name'].endswith('.deb'):
+                      print(asset['id'])
+                      sys.exit(0)
+              sys.exit(1)
+          PY
+          )
+          if [ -z "$asset_id" ]; then
+            echo "No .deb asset found for release $release_id" >&2
+            exit 1
+          fi
+          curl -L -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" -o eevee.deb
+      - name: Build IPA
+        run: |
+          chmod +x ./build-ipa-local.sh
+          ./build-ipa-local.sh spotify.ipa
+      - name: Upload IPA assets to release
+        run: |
+          upload_url='${{ steps.release_info.outputs.upload_url }}'
+          for ipa in Outputs/IPAS/*.ipa; do
+            [ -f "$ipa" ] || continue
+            name=$(basename "$ipa")
+            curl -fsSL -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$ipa" "${upload_url}?name=$name"
+          done
