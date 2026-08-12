@@ -1,7 +1,16 @@
-name: Auto Sync and Build Release (fixed)
+name: Auto Sync and Build Release
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Build even if upstream has no new tag'
+        required: false
+        default: 'false'
+      ipa_url:
+        description: 'Override: direct URL to a decrypted Spotify IPA (defaults to the VANILLA_IPA_URL secret)'
+        required: false
+        default: ''
   push:
     paths:
       - '.github/ci-trigger-sync.txt'
@@ -14,6 +23,10 @@ permissions:
 concurrency:
   group: auto-sync-and-build
   cancel-in-progress: true
+
+env:
+  SWIFTPROTOBUF_VERSION: '1.29.0'
+  THEOS: ${{ github.workspace }}/theos
 
 jobs:
   sync:
@@ -35,127 +48,135 @@ jobs:
 
       - name: Add upstream and fetch
         run: |
-          git remote add upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git || true
-          git fetch --tags upstream || true
-          git fetch --tags origin || true
+          git remote add upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git
+          git fetch --tags upstream
+          git fetch --tags origin
 
       - id: determine
-        name: Determine build necessity
+        name: Determine build necessity and sync
         run: |
           set -e
-          upstream_tag=$(git ls-remote --tags upstream | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1 || true)
-          origin_tag=$(git ls-remote --tags origin | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1 || true)
-          echo "upstream=$upstream_tag"
-          echo "origin=$origin_tag"
-          if [ -n "$upstream_tag" ] && [ "$upstream_tag" != "$origin_tag" ]; then
-            echo "tag_name=$upstream_tag" >> "$GITHUB_OUTPUT"
-            echo "build_needed=true" >> "$GITHUB_OUTPUT"
-            if git show-ref --verify --quiet refs/heads/Master; then git checkout Master || true; else git checkout -b Master || true; fi
-            git fetch upstream || true
-            git merge --ff-only upstream/Master || git merge --ff-only upstream/main || true
-            git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
-            git push origin HEAD:Master || true
-          else
+          upstream_tag=$(git ls-remote --tags upstream | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1)
+          origin_tag=$(git ls-remote --tags origin | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1)
+          echo "upstream tag: $upstream_tag"
+          echo "origin tag:   $origin_tag"
+
+          if [ -z "$upstream_tag" ]; then
             echo "tag_name=" >> "$GITHUB_OUTPUT"
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          echo "tag_name=$upstream_tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$upstream_tag" = "$origin_tag" ]; then
+            if [ "${{ github.event.inputs.force_build }}" = 'true' ]; then
+              echo "build_needed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          git checkout Master
+          if ! git merge --ff-only upstream/Master; then
+            echo "::error::Fork's Master has diverged from upstream/Master and can't be fast-forwarded. Resolve manually."
+            exit 1
+          fi
+          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
+          git push origin Master
+
   build:
-    name: Build DEB and IPA
+    name: Build DEB and IPA, publish release
     needs: sync
-    runs-on: macos-latest
     if: needs.sync.outputs.build_needed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout Theos
+        uses: actions/checkout@v5
+        with:
+          repository: theos/theos
+          path: ${{ github.workspace }}/theos
+          submodules: recursive
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3.0'
 
       - name: Install build tools
         run: |
-          brew update || true
-          brew install dpkg ldid wget unzip zip python3 jq || true
-
-      - name: Install Theos
-        run: |
-          if [ ! -d "$HOME/theos" ]; then git clone --depth=1 https://github.com/theos/theos "$HOME/theos"; fi
-          export THEOS="$HOME/theos"
-          echo "THEOS=$THEOS"
-
-      - name: Build DEB
-        run: |
-          set -e
-          export THEOS="$HOME/theos"
-          if [ -f Makefile ]; then make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless || true; fi
-          debfile=$(find . -type f -name "*.deb" | head -n1 || true)
-          mkdir -p output
-          if [ -n "$debfile" ]; then cp "$debfile" output/ || true; fi
-          ls -la output || true
+          brew install make dpkg ldid wget unzip zip
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then SUFFIX=macos-amd64; else SUFFIX=macos-arm64; fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
 
       - id: ipa_source
         name: Determine IPA source
         run: |
-          # Determine whether to build IPA from workflow input, repository secret, or skip
-          build_ipa=false
-          IPA_URL=""
           if [ -n "${{ github.event.inputs.ipa_url }}" ]; then
-            IPA_URL="${{ github.event.inputs.ipa_url }}"
-            build_ipa=true
+            echo "url=${{ github.event.inputs.ipa_url }}" >> "$GITHUB_OUTPUT"
+            echo "build_ipa=true" >> "$GITHUB_OUTPUT"
           elif [ -n "${{ secrets.VANILLA_IPA_URL }}" ]; then
-            IPA_URL="${{ secrets.VANILLA_IPA_URL }}"
-            build_ipa=true
+            echo "url=${{ secrets.VANILLA_IPA_URL }}" >> "$GITHUB_OUTPUT"
+            echo "build_ipa=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_ipa=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "IPA_URL=$IPA_URL" >> $GITHUB_OUTPUT
-          echo "build_ipa=$build_ipa" >> $GITHUB_OUTPUT
-
-      - name: Install IPA build tools
-        if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          brew install wget unzip zip || true
-          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git || true
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ]; then SUFFIX=macos-amd64; else SUFFIX=macos-arm64; fi
-          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch || true
-          sudo chmod +x /usr/local/bin/ipapatch || true
 
       - name: Download vanilla IPA
         if: steps.ipa_source.outputs.build_ipa == 'true'
-        run: |
-          echo "Downloading IPA from ${{ steps.ipa_source.outputs.IPA_URL }}"
-          mkdir -p vanilla
-          curl -L -o vanilla/vanilla.ipa "${{ steps.ipa_source.outputs.IPA_URL }}"
-          ls -la vanilla || true
+        env:
+          IPA_URL: ${{ steps.ipa_source.outputs.url }}
+        run: curl -fsSL "$IPA_URL" -o spotify.ipa
 
-      - name: Build IPA
+      - name: Build DEB + IPA
         if: steps.ipa_source.outputs.build_ipa == 'true'
         run: |
-          chmod +x ./build-ipa-local.sh || true
-          ./build-ipa-local.sh vanilla/vanilla.ipa output/app.ipa || true
-          ls -la output || true
+          chmod +x ./build-ipa-local.sh
+          ./build-ipa-local.sh spotify.ipa
 
-      - name: Create release and upload assets
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          TAG: ${{ needs.sync.outputs.tag_name }}
+      - name: Build DEB only (no IPA source configured)
+        if: steps.ipa_source.outputs.build_ipa != 'true'
         run: |
-          set -e
-          if [ -z "$TAG" ]; then TAG="autosync-$GITHUB_RUN_ID"; fi
-          echo "Creating release for tag $TAG"
-          payload=$(jq -n --arg t "$TAG" --arg n "$TAG" '{ tag_name: $t, name: $n, body: "Automated build", draft: false, prerelease: false }')
-          rel=$(curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" -d "$payload" "https://api.github.com/repos/$GH_REPO/releases")
-          upload_url=$(echo "$rel" | jq -r .upload_url)
-          upload_url="${upload_url%\{*}"
+          make build-eeveeswiftprotobuf
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
 
-          for f in output/*; do
-            [ -f "$f" ] || continue
-            name=$(basename "$f")
-            echo "Uploading $name"
-            curl -s -X POST -H "Authorization: token $GH_PAT" -H "Content-Type: application/octet-stream" --data-binary @"$f" "$upload_url?name=$name"
-          done
+      - name: Collect build outputs
+        run: |
+          mkdir -p output
+          deb=$(find packages -maxdepth 1 -name '*.deb' | head -n1)
+          if [ -n "$deb" ]; then cp "$deb" output/; fi
+          ipa=$(find Outputs/IPAS -maxdepth 1 -name '*.ipa' 2>/dev/null | head -n1)
+          if [ -n "$ipa" ]; then cp "$ipa" output/; fi
+          ls -la output
+          if [ -z "$(ls -A output)" ]; then
+            echo "::error::No build artifacts were produced (neither .deb nor .ipa)"
+            exit 1
+          fi
 
-      - name: Upload outputs as artifact
+      - name: Upload build outputs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: build-output
-          path: output/
+          name: EeveeSpotify-build-${{ github.run_id }}
+          path: output/*
+          if-no-files-found: error
+
+      - name: Publish release with all built files
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('autosync-{0}', github.run_id) }}
+          name: ${{ needs.sync.outputs.tag_name != '' && needs.sync.outputs.tag_name || format('Autosync {0}', github.run_id) }}
+          body: Automated build of EeveeSpotify packages from upstream fork sync.
+          draft: false
+          prerelease: false
+          files: output/*
