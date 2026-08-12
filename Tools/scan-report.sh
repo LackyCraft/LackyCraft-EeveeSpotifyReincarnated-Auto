@@ -39,6 +39,9 @@ for f in "$@"; do
 
   # --- VirusTotal ---
   echo "### VirusTotal — $name" >> "$REPORT"
+  sha256=$(shasum -a 256 "$f" | awk '{print $1}')
+  vt_link="https://www.virustotal.com/gui/file/$sha256"
+
   if [ -n "${VT_API_KEY:-}" ]; then
     size=$(stat -f%z "$f")
     if [ "$size" -gt 33554432 ]; then
@@ -49,12 +52,14 @@ for f in "$@"; do
 
     if [ -z "$upload_url" ]; then
       echo "_Could not get a VirusTotal upload URL for a file this size._" >> "$REPORT"
+      echo "[Check manually on VirusTotal]($vt_link)" >> "$REPORT"
     else
       resp=$(curl -s -H "x-apikey: $VT_API_KEY" -X POST "$upload_url" -F "file=@${f}")
       analysis_id=$(echo "$resp" | jq -r '.data.id // empty')
 
       if [ -z "$analysis_id" ]; then
         echo "_Upload to VirusTotal failed: $(echo "$resp" | jq -c '.error // .' 2>/dev/null || echo "$resp")_" >> "$REPORT"
+        echo "[Check manually on VirusTotal]($vt_link)" >> "$REPORT"
       else
         status=""
         analysis="{}"
@@ -66,11 +71,13 @@ for f in "$@"; do
         done
 
         if [ "$status" != "completed" ]; then
-          echo "_Scan did not finish in time (last status: ${status:-unknown}). Check manually: https://www.virustotal.com/gui/file-analysis/$analysis_id_" >> "$REPORT"
+          echo "_Scan did not finish in time (last status: ${status:-unknown})._" >> "$REPORT"
+          echo "[Check status on VirusTotal]($vt_link)" >> "$REPORT"
         else
           malicious=$(echo "$analysis" | jq -r '.data.attributes.stats.malicious // 0')
           suspicious=$(echo "$analysis" | jq -r '.data.attributes.stats.suspicious // 0')
           echo "Malicious: $malicious, Suspicious: $suspicious" >> "$REPORT"
+          echo "[Full report on VirusTotal]($vt_link)" >> "$REPORT"
           if [ "$malicious" != "0" ] || [ "$suspicious" != "0" ]; then
             echo >> "$REPORT"
             echo "Flagged by:" >> "$REPORT"
@@ -84,7 +91,8 @@ for f in "$@"; do
       fi
     fi
   else
-    echo "_VirusTotal skipped: VT_API_KEY secret not configured._" >> "$REPORT"
+    echo "_VirusTotal API key not configured, automatic scan skipped._" >> "$REPORT"
+    echo "[Check this file on VirusTotal]($vt_link) - shows existing results if this exact file was scanned before, or lets you upload it manually." >> "$REPORT"
   fi
   echo >> "$REPORT"
 done
