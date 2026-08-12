@@ -29,7 +29,7 @@ jobs:
       tag_name: ${{ steps.check.outputs.tag_name }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Add upstream remote
@@ -56,11 +56,10 @@ jobs:
             exit 0
           fi
           git checkout Master
-          if ! git merge-base --is-ancestor HEAD upstream/Master; then
-            echo "Your forked Master has diverged from upstream. Fix this manually." >&2
+          if ! git merge --no-ff --no-edit upstream/Master; then
+            echo "Your forked Master has local changes that conflict with upstream. Resolve the conflict manually." >&2
             exit 1
           fi
-          git merge --ff-only upstream/Master
           git push origin Master
           git push origin --tags
           echo "build_needed=true" >> $GITHUB_OUTPUT
