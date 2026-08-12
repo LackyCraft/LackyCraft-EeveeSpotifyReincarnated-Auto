@@ -1,0 +1,2 @@
+Triggered by assistant at 2026-08-12T13:49:29+03:00
+This file exists to trigger the auto sync and build workflow on push.
