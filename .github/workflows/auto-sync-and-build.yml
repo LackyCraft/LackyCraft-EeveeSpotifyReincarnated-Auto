@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 env:
   SWIFTPROTOBUF_VERSION: '1.29.0'
@@ -62,7 +61,6 @@ jobs:
             exit 1
           fi
           git push origin Master
-          git push origin "$upstream_tag"
           echo "build_needed=true" >> $GITHUB_OUTPUT
           echo "tag_name=$upstream_tag" >> $GITHUB_OUTPUT
   build:
