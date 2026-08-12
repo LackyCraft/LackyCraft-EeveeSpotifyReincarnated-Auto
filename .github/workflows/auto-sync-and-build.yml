@@ -54,12 +54,13 @@ jobs:
 
       - id: determine
         name: Determine build necessity and sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -e
-          upstream_tag=$(git ls-remote --tags upstream | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1)
-          origin_tag=$(git ls-remote --tags origin | awk -F'/' '/refs\/tags\//{print $2}' | sed 's/\^{}//' | sort -V | tail -n1)
+          upstream_tag=$(git ls-remote --tags upstream | awk '{print $2}' | sed 's#refs/tags/##' | grep -v '{}' | sort -V | tail -n1)
           echo "upstream tag: $upstream_tag"
-          echo "origin tag:   $origin_tag"
 
           if [ -z "$upstream_tag" ]; then
             echo "tag_name=" >> "$GITHUB_OUTPUT"
@@ -69,12 +70,13 @@ jobs:
 
           echo "tag_name=$upstream_tag" >> "$GITHUB_OUTPUT"
 
-          if [ "$upstream_tag" = "$origin_tag" ]; then
-            if [ "${{ github.event.inputs.force_build }}" = 'true' ]; then
-              echo "build_needed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "build_needed=false" >> "$GITHUB_OUTPUT"
-            fi
+          # A release already published for this tag means we've already built it.
+          release_status=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GH_REPO/releases/tags/$upstream_tag")
+          echo "release status for $upstream_tag: $release_status"
+
+          if [ "$release_status" = "200" ] && [ "${{ github.event.inputs.force_build }}" != 'true' ]; then
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
