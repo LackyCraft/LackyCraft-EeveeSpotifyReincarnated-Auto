@@ -101,7 +101,45 @@ Both reports are attached to the release as `.md` files **and** their full conte
 
 ### Ready builds always land in Releases
 
-Every successful run ends up on your fork's **[Releases](../../releases)** page, tagged with the upstream version (e.g. `v6.6.7`). Attached to that one release: the `.deb`, the `.ipa` (when a decrypted source was available), and both scan reports — plus a build summary (EeveeSpotify version, patched Spotify version, file sizes, scan results) directly in the release description.
+Every successful run ends up on your fork's **[Releases](../../releases)** page, tagged with the upstream version (e.g. `v6.6.7`). Attached to that one release: the `.deb`, **two** `.ipa` builds (see below - pick the one without `-zxpi-experimental` in the name unless you know you need the other), and both scan reports — plus a build summary (EeveeSpotify version, patched Spotify version, file sizes, scan results) directly in the release description.
+
+### Known issue: IPA fails to install / ldid assert
+
+If you install the `.ipa` (via SideStore, and reportedly AltStore too) and get an error like:
+
+```
+AltSign.Error 0 ldid.cpp(1461): _assert(): end >= size - 0x10
+```
+
+...the app doesn't get installed. **This is why every build now ships two `.ipa` files:**
+
+| File | What it is | Status |
+|---|---|---|
+| `EeveeSpotify-<ver>-<spotifyver>.ipa` | `cyan`-injected only, no `ipapatch` | **Recommended.** Confirmed installable via SideStore. |
+| `EeveeSpotify-<ver>-<spotifyver>-zxpi-experimental.ipa` | same, plus `zxPluginsInject` LC-injected via `ipapatch` (keychain redirect, group containers, CloudKit stub — sideload compatibility extras) | Experimental. Known to trigger the `ldid` assert above on SideStore/AltStore. May still work on TrollStore, which doesn't need to re-sign the binary at install time (untested). |
+
+**How this was found and confirmed** (root-caused with a dedicated CI experiment, not guesswork):
+
+We built the tweak once, then produced five differently-processed copies of the same IPA from that one build and tested each on a real device via SideStore:
+
+1. `cyan` injection only, no `ipapatch` → **installed successfully**
+2. `cyan` + `ipapatch` (what the pipeline used to always ship) → failed, same assert
+3. `cyan` + `ipapatch` + an explicit `ldid` re-sign pass afterward, with entitlements preserved → the re-sign step itself crashed **with the identical assert**, right in CI, no phone needed - proving this isn't a SideStore-specific quirk
+4. `cyan` + `ipapatch`, repackaged with `ditto` instead of `zip` (a workaround suggested in community reports) → failed, same assert - rules out the zip container/archive structure as the cause
+5. Variant 2's output under a plain filename with no version numbers - → failed, same assert - rules out the `-patched`/filename-based theory some people online suggest
+
+Conclusion: **`ipapatch`'s LC-injection of `zxPluginsInject.dylib` into the main executable and all four app extensions produces a Mach-O binary that can still be *read* (`ldid -e` succeeds) but can no longer be correctly *re-signed*** (`ldid -S` reproducibly asserts). SideStore (and apparently other sideloading tools) must re-sign the binary with their own provisioning/entitlements at install time, so they hit this exact operation and fail the same way our own CI re-sign attempt did.
+
+We also checked the project's own history: the original [whoeevee/EeveeSpotifyReborn](https://github.com/whoeevee/EeveeSpotifyReborn) already shipped two IPAs per release — a plain one and a `-patched` one made by running `ipapatch` on it (with no `--dylib` at all, so this isn't specific to the `zxPluginsInject` use case either) — and [issue #83 in that repo](https://github.com/whoeevee/EeveeSpotifyReborn/issues/83) reports the exact same assert.
+
+Sources consulted while diagnosing this (same bug reported against completely unrelated apps - Spotube, Kodi, Flutter apps, Mangayomi - across multiple sideloading tools, with no fix ever landed by any of their maintainers):
+- [whoeevee/EeveeSpotifyReborn#83](https://github.com/whoeevee/EeveeSpotifyReborn/issues/83)
+- [SideStore/SideStore#818](https://github.com/SideStore/SideStore/issues/818), [#699](https://github.com/SideStore/SideStore/issues/699)
+- [altstoreio/AltStore#1034](https://github.com/altstoreio/AltStore/issues/1034), [#1660](https://github.com/altstoreio/AltStore/issues/1660)
+- [LiveContainer/LiveContainer#134](https://github.com/LiveContainer/LiveContainer/issues/134)
+- [asdfzxcvbn/ipapatch releases/changelog](https://github.com/asdfzxcvbn/ipapatch/releases)
+
+If you want to dig further yourself: `.github/workflows/debug-ipa-signing-test.yml` (manual `workflow_dispatch` only, not part of the release pipeline) rebuilds all five variants above and uploads them as a single workflow artifact, plus runs `otool -l` / `ldid -e` against the vanilla, cyan-only, and cyan+ipapatch binaries directly in CI so you can inspect `LC_CODE_SIGNATURE`/`LC_SYMTAB` without a device at all.
 
 ### Rebuilding just the IPA (`auto-build-ipa.yml`)
 
@@ -293,7 +331,45 @@ This tweak is created solely for **personal and educational purposes**. Use it a
 
 ### Готовые сборки всегда попадают в Releases
 
-Каждый успешный прогон оказывается на странице **[Releases](../../releases)** твоего форка, с тегом версии апстрима (например, `v6.6.7`). К этому релизу прикреплены: `.deb`, `.ipa` (если был доступен дешифрованный источник) и оба отчёта сканирования — плюс сводка сборки (версия EeveeSpotify, версия пропатченного Spotify, размеры файлов, результаты сканов) прямо в описании релиза.
+Каждый успешный прогон оказывается на странице **[Releases](../../releases)** твоего форка, с тегом версии апстрима (например, `v6.6.7`). К этому релизу прикреплены: `.deb`, **два** `.ipa`-файла (см. ниже — если не уверен, бери тот, что без `-zxpi-experimental` в имени) и оба отчёта сканирования — плюс сводка сборки (версия EeveeSpotify, версия пропатченного Spotify, размеры файлов, результаты сканов) прямо в описании релиза.
+
+### Известная проблема: IPA не устанавливается / ldid assert
+
+Если при установке `.ipa` (через SideStore, судя по отзывам — и AltStore тоже) вылетает ошибка вроде:
+
+```
+AltSign.Error 0 ldid.cpp(1461): _assert(): end >= size - 0x10
+```
+
+...приложение не ставится. **Именно поэтому теперь каждая сборка выпускает два `.ipa`-файла:**
+
+| Файл | Что это | Статус |
+|---|---|---|
+| `EeveeSpotify-<вер>-<версия spotify>.ipa` | только инъекция через `cyan`, без `ipapatch` | **Рекомендуется.** Подтверждённо ставится через SideStore. |
+| `EeveeSpotify-<вер>-<версия spotify>-zxpi-experimental.ipa` | то же самое + `zxPluginsInject` через LC-инъекцию `ipapatch` (keychain redirect, group containers, CloudKit stub — доп. фиксы для сайдлоада) | Экспериментальный. Точно вызывает вышеуказанный ldid assert на SideStore/AltStore. Возможно, заведётся на TrollStore, который не переподписывает бинарник при установке (не проверено). |
+
+**Как это было найдено и подтверждено** (не догадка, а результат отдельного эксперимента в CI):
+
+Собрали твик один раз, затем сделали пять по-разному обработанных копий одного и того же IPA из этой сборки и проверили каждую на реальном устройстве через SideStore:
+
+1. только инъекция `cyan`, без `ipapatch` → **установился успешно**
+2. `cyan` + `ipapatch` (то, что пайплайн раньше всегда собирал) → упал, та же ошибка
+3. `cyan` + `ipapatch` + явная попытка переподписать через `ldid` (с сохранением entitlements) → сам шаг переподписи упал **с точно такой же ошибкой**, прямо в CI, без всякого телефона — это доказывает, что проблема не специфична именно для SideStore
+4. `cyan` + `ipapatch`, пересобранный через `ditto` вместо `zip` (воркэраунд, который упоминался в комьюнити) → упал, та же ошибка — снимает гипотезу про структуру zip-архива
+5. Вывод варианта 2 под простым именем файла, без номеров версий → упал, та же ошибка — снимает гипотезу про имя файла/суффикс `-patched`, которую высказывали в интернете
+
+Вывод: **LC-инъекция `zxPluginsInject.dylib` через `ipapatch` в основной исполняемый файл и все четыре расширения приложения производит Mach-O, который всё ещё можно *прочитать* (`ldid -e` отрабатывает), но уже нельзя корректно *переподписать*** (`ldid -S` стабильно падает с ассертом). SideStore (и, судя по всему, другие инструменты сайдлоада) обязаны переподписать бинарник своим provisioning/entitlements при установке — и натыкаются ровно на ту же операцию, на которой упала наша собственная попытка переподписи в CI.
+
+Также проверили историю проекта: оригинальный [whoeevee/EeveeSpotifyReborn](https://github.com/whoeevee/EeveeSpotifyReborn) уже выпускал по два IPA на релиз — обычный и `-patched`, сделанный прогоном через `ipapatch` (причём вообще без `--dylib`, то есть дело не специфично именно для случая с `zxPluginsInject`) — и [issue #83 в этом репозитории](https://github.com/whoeevee/EeveeSpotifyReborn/issues/83) сообщает о точно такой же ошибке.
+
+Источники, которые изучили при диагностике (тот же баг репортят на совершенно не связанных приложениях — Spotube, Kodi, Flutter-приложения, Mangayomi — в разных инструментах сайдлоада, и ни один мейнтейнер так и не выкатил фикс):
+- [whoeevee/EeveeSpotifyReborn#83](https://github.com/whoeevee/EeveeSpotifyReborn/issues/83)
+- [SideStore/SideStore#818](https://github.com/SideStore/SideStore/issues/818), [#699](https://github.com/SideStore/SideStore/issues/699)
+- [altstoreio/AltStore#1034](https://github.com/altstoreio/AltStore/issues/1034), [#1660](https://github.com/altstoreio/AltStore/issues/1660)
+- [LiveContainer/LiveContainer#134](https://github.com/LiveContainer/LiveContainer/issues/134)
+- [asdfzxcvbn/ipapatch releases/changelog](https://github.com/asdfzxcvbn/ipapatch/releases)
+
+Если хочешь покопаться сам: `.github/workflows/debug-ipa-signing-test.yml` (только ручной `workflow_dispatch`, не часть релизного пайплайна) пересобирает все пять вариантов выше и выгружает их одним артефактом, плюс гоняет `otool -l` / `ldid -e` прямо в CI по ванильному, cyan-only и cyan+ipapatch бинарникам — можно смотреть `LC_CODE_SIGNATURE`/`LC_SYMTAB` вообще без устройства.
 
 ### Пересобрать только IPA (`auto-build-ipa.yml`)
 
