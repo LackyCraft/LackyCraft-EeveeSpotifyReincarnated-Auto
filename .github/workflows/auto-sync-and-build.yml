@@ -228,8 +228,16 @@ jobs:
           mkdir -p output
           deb=$(find packages -maxdepth 1 -name '*.deb' | head -n1)
           if [ -n "$deb" ]; then cp "$deb" output/; fi
-          ipa=$(find Outputs/IPAS -maxdepth 1 -name '*.ipa' 2>/dev/null | head -n1)
-          if [ -n "$ipa" ]; then cp "$ipa" output/; fi
+
+          # build-ipa-local.sh produces up to two IPAs:
+          #  - EeveeSpotify-<ver>-<spotifyver>.ipa                  (stable, no ipapatch)
+          #  - EeveeSpotify-<ver>-<spotifyver>-zxpi-experimental.ipa (adds zxPluginsInject via ipapatch;
+          #    known to fail re-signing on some install tools, see README)
+          stable_ipa=$(find Outputs/IPAS -maxdepth 1 -name '*.ipa' ! -name '*-zxpi-experimental.ipa' 2>/dev/null | head -n1)
+          experimental_ipa=$(find Outputs/IPAS -maxdepth 1 -name '*-zxpi-experimental.ipa' 2>/dev/null | head -n1)
+          [ -n "$stable_ipa" ] && cp "$stable_ipa" output/
+          [ -n "$experimental_ipa" ] && cp "$experimental_ipa" output/
+
           ls -la output
           if [ -z "$(ls -A output)" ]; then
             echo "::error::No build artifacts were produced (neither .deb nor .ipa)"
@@ -239,13 +247,18 @@ jobs:
           eevee_version=$(grep -E '^Version:' control | awk '{print $2}')
           echo "eevee_version=$eevee_version" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$ipa" ]; then
+          if [ -n "$stable_ipa" ]; then
             echo "ipa_included=true" >> "$GITHUB_OUTPUT"
             # built as EeveeSpotify-<eevee_version>-<spotify_version>.ipa
-            spotify_version=$(basename "$ipa" .ipa | awk -F'-' '{print $3}')
+            spotify_version=$(basename "$stable_ipa" .ipa | awk -F'-' '{print $3}')
             echo "spotify_version=$spotify_version" >> "$GITHUB_OUTPUT"
           else
             echo "ipa_included=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$experimental_ipa" ]; then
+            echo "experimental_ipa_included=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "experimental_ipa_included=false" >> "$GITHUB_OUTPUT"
           fi
 
       - id: postpatch_scan
@@ -287,7 +300,14 @@ jobs:
             done
             echo
             if [ "${{ steps.outputs.outputs.ipa_included }}" = "true" ]; then
-              echo "Includes both \`.deb\` (for jailbroken devices) and a patched \`.ipa\` (ready to sideload)."
+              echo "Includes \`.deb\` (for jailbroken devices) and **two** \`.ipa\` builds - pick one:"
+              echo
+              echo "- **\`EeveeSpotify-*.ipa\`** (no \`-zxpi-experimental\` suffix) - **recommended, stable.** Confirmed installable via SideStore."
+              if [ "${{ steps.outputs.outputs.experimental_ipa_included }}" = "true" ]; then
+                echo "- **\`EeveeSpotify-*-zxpi-experimental.ipa\`** - adds the zxPluginsInject sideload-compat shim (keychain redirect, group containers, CloudKit stub) via \`ipapatch\`, but that LC-injection is known to break re-signing on some install tools (SideStore/AltStore fail with a \`ldid\` assert; TrollStore, which doesn't need to re-sign, may still work). **Try the stable build first.**"
+              fi
+              echo
+              echo "Full writeup of this issue, how it was diagnosed, and sources: see [README.md § Known issue: IPA fails to install](README.md#known-issue-ipa-fails-to-install--ldid-assert)."
             elif [ "${{ steps.ipa_source.outputs.build_ipa }}" = "true" ]; then
               echo "**Only \`.deb\` is included** - ${{ steps.ipa_status.outputs.reason }}"
               echo "Update the \`VANILLA_IPA_URL\` secret (or pass \`ipa_url\`) and re-run the workflow to also get an \`.ipa\`."

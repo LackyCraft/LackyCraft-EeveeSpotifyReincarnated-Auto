@@ -8,10 +8,18 @@
 #   2. theos `make package FINALPACKAGE=1` — produces .deb with
 #      EeveeSpotify.dylib + EeveeSpotify.bundle + framework.
 #   3. Build zxPluginsInject.dylib — sideload compat shim (keychain redirect,
-#      group containers, CloudKit stub). LC-injected via ipapatch in step 6.
+#      group containers, CloudKit stub).
 #   4. cyan inject deb-contents (dylib + framework + bundle) into vanilla IPA.
-#   5. ipapatch LC-inject zxPluginsInject into main exec + every appex.
-#   6. Strip Watch.app if it survived cyan -du.
+#      This is the STABLE output — confirmed installable via SideStore.
+#   5. Strip Watch.app if it survived cyan -du.
+#   6. Produce a SECOND, EXPERIMENTAL ipa: a copy of the stable one with
+#      zxPluginsInject LC-injected via ipapatch into the main exec + every
+#      appex. ipapatch's LC-injection produces a Mach-O that ldid can read
+#      but apparently can't re-sign afterward (assert "end >= size - 0x10"),
+#      which is exactly what SideStore/AltStore need to do at install time —
+#      so this variant may fail to install there. See README.md
+#      ("Known issue: IPA fails to install / ldid assert") for the full
+#      writeup and how this was diagnosed.
 #
 # Requires: theos, cyan (pyzule-rw), ipapatch, dpkg, ldid, plutil.
 
@@ -33,6 +41,7 @@ SPOT_VERSION=$(unzip -p "$VANILLA_IPA" 'Payload/Spotify.app/Info.plist' \
     | plutil -extract CFBundleShortVersionString raw - 2>/dev/null || echo "unknown")
 OUT_DIR="Outputs/IPAS"
 OUT_IPA="$OUT_DIR/EeveeSpotify-${VERSION}-${SPOT_VERSION}.ipa"
+OUT_IPA_ZXPI="$OUT_DIR/EeveeSpotify-${VERSION}-${SPOT_VERSION}-zxpi-experimental.ipa"
 mkdir -p "$OUT_DIR"
 
 color() { printf '\033[1;32m==> %s\033[0m\n' "$*"; }
@@ -59,15 +68,12 @@ BUNDLE_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSpotify.bundle' | head -1)
 FRAMEWORK_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSwiftProtobuf.framework' | head -1)
 [ -n "$DYLIB_SRC" ] || { echo "dylib not in deb"; exit 1; }
 
-color "5/6  cyan inject"
+color "5/6  cyan inject (stable output, no ipapatch)"
 INJECT=("$DYLIB_SRC")
 [ -n "$FRAMEWORK_SRC" ] && INJECT+=("$FRAMEWORK_SRC")
 [ -n "$BUNDLE_SRC" ]    && INJECT+=("$BUNDLE_SRC")
 rm -f "$OUT_IPA"
 cyan -i "$VANILLA_IPA" -o "$OUT_IPA" -f "${INJECT[@]}" -c 9 -m 15.0 -du
-
-color "6/6  ipapatch LC-inject zxPluginsInject"
-ipapatch --input "$OUT_IPA" --inplace --noconfirm --dylib packages/zxPluginsInject.dylib
 
 # Belt-and-suspenders: cyan -du strips appex/Watch but verify.
 cd "$OUT_DIR"
@@ -80,6 +86,14 @@ fi
 rm -rf Payload
 cd - >/dev/null
 
+color "6/6  ipapatch LC-inject zxPluginsInject (EXPERIMENTAL variant, separate file)"
+cp "$OUT_IPA" "$OUT_IPA_ZXPI"
+ipapatch --input "$OUT_IPA_ZXPI" --inplace --noconfirm --dylib packages/zxPluginsInject.dylib || \
+    echo "ipapatch step failed - continuing without the experimental variant" >&2
+
 color "Done"
-ls -lh "$OUT_IPA"
+ls -lh "$OUT_IPA" "$OUT_IPA_ZXPI" 2>/dev/null || true
+echo "Recommended: $(basename "$OUT_IPA") - stable, confirmed installable via SideStore."
+echo "Experimental: $(basename "$OUT_IPA_ZXPI") - adds zxPluginsInject sideload-compat shim via ipapatch," \
+     "but that LC-injection is known to break re-signing (ldid assert) on some install tools. See README.md."
 echo "Sign with Sideloadly / AltStore / TrollStore."
