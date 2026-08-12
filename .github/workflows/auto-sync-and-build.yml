@@ -235,8 +235,15 @@ jobs:
             echo "::error::No build artifacts were produced (neither .deb nor .ipa)"
             exit 1
           fi
+
+          eevee_version=$(grep -E '^Version:' control | awk '{print $2}')
+          echo "eevee_version=$eevee_version" >> "$GITHUB_OUTPUT"
+
           if [ -n "$ipa" ]; then
             echo "ipa_included=true" >> "$GITHUB_OUTPUT"
+            # built as EeveeSpotify-<eevee_version>-<spotify_version>.ipa
+            spotify_version=$(basename "$ipa" .ipa | awk -F'-' '{print $3}')
+            echo "spotify_version=$spotify_version" >> "$GITHUB_OUTPUT"
           else
             echo "ipa_included=false" >> "$GITHUB_OUTPUT"
           fi
@@ -257,24 +264,47 @@ jobs:
       - name: Compose release notes
         run: |
           {
-            echo "Automated build of EeveeSpotify packages from upstream fork sync."
+            echo "Automated build of EeveeSpotify from upstream fork sync ([SideloadLabs/EeveeSpotifyReincarnated](https://github.com/SideloadLabs/EeveeSpotifyReincarnated))."
+            echo
+            echo "### Build info"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| EeveeSpotify version | \`${{ steps.outputs.outputs.eevee_version }}\` |"
+            if [ "${{ steps.outputs.outputs.ipa_included }}" = "true" ]; then
+              echo "| Spotify version patched | \`${{ steps.outputs.outputs.spotify_version }}\` |"
+            fi
+            echo "| Upstream tag | \`${{ needs.sync.outputs.tag_name }}\` |"
+            echo "| Triggered by | \`${{ github.event_name }}\` |"
+            echo
+            echo "### Files"
+            echo
+            echo "| File | Size |"
+            echo "|---|---|"
+            for f in output/*; do
+              [ -f "$f" ] || continue
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+            done
             echo
             if [ "${{ steps.outputs.outputs.ipa_included }}" = "true" ]; then
-              echo "Includes .deb and .ipa."
+              echo "Includes both \`.deb\` (for jailbroken devices) and a patched \`.ipa\` (ready to sideload)."
             elif [ "${{ steps.ipa_source.outputs.build_ipa }}" = "true" ]; then
-              echo "Only .deb is included - ${{ steps.ipa_status.outputs.reason }}"
-              echo "Update the VANILLA_IPA_URL secret (or pass ipa_url) and re-run the workflow to also get an .ipa."
+              echo "**Only \`.deb\` is included** - ${{ steps.ipa_status.outputs.reason }}"
+              echo "Update the \`VANILLA_IPA_URL\` secret (or pass \`ipa_url\`) and re-run the workflow to also get an \`.ipa\`."
             else
-              echo "Only .deb is included - no VANILLA_IPA_URL secret (or ipa_url input) was configured."
+              echo "**Only \`.deb\` is included** - no \`VANILLA_IPA_URL\` secret (or \`ipa_url\` input) was configured."
             fi
             echo
             if [ "${{ steps.prepatch_scan.outputs.critical }}" = "true" ] || [ "${{ steps.postpatch_scan.outputs.critical }}" = "true" ]; then
               echo "## ⚠️ SECURITY WARNING"
               echo "Antivirus scanning flagged one or more files in this build as malicious/suspicious."
-              echo "**Do not install until you've reviewed the attached scan reports.**"
+              echo "**Do not install until you've reviewed the scan results below.**"
               echo
             fi
-            echo "Antivirus scan reports (ClamAV + VirusTotal, before and after patching) are attached below."
+            echo "### Antivirus scans"
+            echo
+            [ -f reports/prepatch-scan.md ] && { cat reports/prepatch-scan.md; echo; }
+            [ -f reports/postpatch-scan.md ] && { cat reports/postpatch-scan.md; echo; }
           } > release-body.md
           cat release-body.md >> "$GITHUB_STEP_SUMMARY"
 

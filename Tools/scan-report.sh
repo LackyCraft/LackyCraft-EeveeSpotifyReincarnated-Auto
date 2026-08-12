@@ -92,7 +92,10 @@ for f in "$@"; do
     fi
   else
     echo "_VirusTotal API key not configured, automatic scan skipped._" >> "$REPORT"
-    echo "[Check this file on VirusTotal]($vt_link) - shows existing results if this exact file was scanned before, or lets you upload it manually." >> "$REPORT"
+    echo "This is a freshly built/patched file, so it almost certainly has no prior record on VirusTotal yet -" >> "$REPORT"
+    echo "the link below will likely show \"Item not found\" unless someone already uploaded this exact build." >> "$REPORT"
+    echo "Set the \`VT_API_KEY\` repo secret to get a real automatic scan on every build instead." >> "$REPORT"
+    echo "[Look up / manually upload on VirusTotal]($vt_link)" >> "$REPORT"
   fi
   echo >> "$REPORT"
 done
