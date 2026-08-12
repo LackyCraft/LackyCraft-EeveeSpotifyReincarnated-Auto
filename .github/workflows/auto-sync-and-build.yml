@@ -1,4 +1,4 @@
-name: Auto Sync and Build Release (simplified)
+name: Auto Sync and Build Release (fixed)
 
 on:
   workflow_dispatch: {}
@@ -11,8 +11,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: auto-sync-and-build
+  cancel-in-progress: true
+
 jobs:
   sync:
+    name: Sync fork with upstream
     runs-on: ubuntu-latest
     outputs:
       tag_name: ${{ steps.determine.outputs.tag_name }}
@@ -56,6 +61,7 @@ jobs:
           fi
 
   build:
+    name: Build DEB and IPA
     needs: sync
     runs-on: macos-latest
     if: needs.sync.outputs.build_needed == 'true' || github.event_name == 'workflow_dispatch'
@@ -68,12 +74,13 @@ jobs:
       - name: Install build tools
         run: |
           brew update || true
-          brew install dpkg ldid wget unzip zip python3 || true
+          brew install dpkg ldid wget unzip zip python3 jq || true
 
       - name: Install Theos
         run: |
           if [ ! -d "$HOME/theos" ]; then git clone --depth=1 https://github.com/theos/theos "$HOME/theos"; fi
           export THEOS="$HOME/theos"
+          echo "THEOS=$THEOS"
 
       - name: Build DEB
         run: |
@@ -82,55 +89,70 @@ jobs:
           if [ -f Makefile ]; then make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless || true; fi
           debfile=$(find . -type f -name "*.deb" | head -n1 || true)
           mkdir -p output
-          if [ -n "$debfile" ]; then cp "$debfile" output/; fi
+          if [ -n "$debfile" ]; then cp "$debfile" output/ || true; fi
           ls -la output || true
 
-      - name: Create release + upload assets (shell)
+      - id: ipa_source
+        name: Determine IPA source
+        run: |
+          # Determine whether to build IPA from workflow input, repository secret, or skip
+          build_ipa=false
+          IPA_URL=""
+          if [ -n "${{ github.event.inputs.ipa_url }}" ]; then
+            IPA_URL="${{ github.event.inputs.ipa_url }}"
+            build_ipa=true
+          elif [ -n "${{ secrets.VANILLA_IPA_URL }}" ]; then
+            IPA_URL="${{ secrets.VANILLA_IPA_URL }}"
+            build_ipa=true
+          fi
+          echo "IPA_URL=$IPA_URL" >> $GITHUB_OUTPUT
+          echo "build_ipa=$build_ipa" >> $GITHUB_OUTPUT
+
+      - name: Install IPA build tools
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        run: |
+          brew install wget unzip zip || true
+          python3 -m pip install --upgrade --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git || true
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then SUFFIX=macos-amd64; else SUFFIX=macos-arm64; fi
+          sudo curl -fsSL "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" -o /usr/local/bin/ipapatch || true
+          sudo chmod +x /usr/local/bin/ipapatch || true
+
+      - name: Download vanilla IPA
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        run: |
+          echo "Downloading IPA from ${{ steps.ipa_source.outputs.IPA_URL }}"
+          mkdir -p vanilla
+          curl -L -o vanilla/vanilla.ipa "${{ steps.ipa_source.outputs.IPA_URL }}"
+          ls -la vanilla || true
+
+      - name: Build IPA
+        if: steps.ipa_source.outputs.build_ipa == 'true'
+        run: |
+          chmod +x ./build-ipa-local.sh || true
+          ./build-ipa-local.sh vanilla/vanilla.ipa output/app.ipa || true
+          ls -la output || true
+
+      - name: Create release and upload assets
         env:
           GH_REPO: ${{ github.repository }}
-          GH_OWNER: ${{ github.repository_owner }}
           GH_PAT: ${{ secrets.GH_PAT }}
           TAG: ${{ needs.sync.outputs.tag_name }}
         run: |
           set -e
           if [ -z "$TAG" ]; then TAG="autosync-$GITHUB_RUN_ID"; fi
-          echo "Using tag: $TAG"
-
-          # Create release via API
+          echo "Creating release for tag $TAG"
           payload=$(jq -n --arg t "$TAG" --arg n "$TAG" '{ tag_name: $t, name: $n, body: "Automated build", draft: false, prerelease: false }')
           rel=$(curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github+json" -d "$payload" "https://api.github.com/repos/$GH_REPO/releases")
           upload_url=$(echo "$rel" | jq -r .upload_url)
-          if [ "$upload_url" = "null" ] || [ -z "$upload_url" ]; then
-            echo "Failed to create release: $rel" >&2
-            exit 1
-          fi
-          # normalize upload_url
           upload_url="${upload_url%\{*}"
 
-          # Upload DEB(s)
-          for f in output/*.deb; do
+          for f in output/*; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
-            echo "Uploading $f as $name"
+            echo "Uploading $name"
             curl -s -X POST -H "Authorization: token $GH_PAT" -H "Content-Type: application/octet-stream" --data-binary @"$f" "$upload_url?name=$name"
           done
-
-          # If VANILLA_IPA_URL secret available, download and build IPA
-          if [ -n "${{ secrets.VANILLA_IPA_URL }}" ]; then
-            echo "VANILLA_IPA_URL provided, downloading"
-            mkdir -p vanilla
-            curl -L -o vanilla/vanilla.ipa "${{ secrets.VANILLA_IPA_URL }}"
-            chmod +x ./build-ipa-local.sh || true
-            ./build-ipa-local.sh vanilla/vanilla.ipa output/app.ipa || true
-            for f in output/*.ipa; do
-              [ -f "$f" ] || continue
-              name=$(basename "$f")
-              echo "Uploading $f as $name"
-              curl -s -X POST -H "Authorization: token $GH_PAT" -H "Content-Type: application/octet-stream" --data-binary @"$f" "$upload_url?name=$name"
-            done
-          else
-            echo "No VANILLA_IPA_URL secret set; skipping IPA build"
-          fi
 
       - name: Upload outputs as artifact
         uses: actions/upload-artifact@v4
