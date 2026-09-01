@@ -85,8 +85,12 @@ jobs:
 
           echo "build_needed=true" >> "$GITHUB_OUTPUT"
           git checkout Master
-          if ! git merge --ff-only upstream/Master; then
-            echo "::error::Fork's Master has diverged from upstream/Master and can't be fast-forwarded. Resolve manually."
+          # Our own commits to Master (this workflow, README, build scripts) permanently
+          # diverge it from upstream/Master, so a plain --ff-only merge stops working the
+          # first time both sides have moved on. A regular merge handles that automatically
+          # and only fails (needing manual resolution) on an actual line-level conflict.
+          if ! git merge --no-ff --no-edit upstream/Master; then
+            echo "::error::Merging upstream/Master produced real conflicts (not just divergence) - resolve manually."
             exit 1
           fi
           git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
