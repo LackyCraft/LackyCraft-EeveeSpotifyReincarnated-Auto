@@ -92,6 +92,7 @@ show_instagram_destination_description = "Always show the Instagram share destin
 livecontainer_sharing = "Share to LiveContainer";
 livecontainer_sharing_description = "Share to LiveContainer and copy the URL if the selected destination is not supported.";
 
+
 // Miscellaneous
 
 miscellaneous = "Miscellaneous";
@@ -138,6 +139,7 @@ let_the_music_play = "Let the music play...";
 liked_songs = "Liked songs";
 
 contributors = "Contributors";
+developer_note = "Developer's Note";
 
 request_anonymous_token = "Request Anonymous Token";
 request_anonymous_token_description = "Tap “Request Anonymous Token” to request a token from Musixmatch without authorization.";

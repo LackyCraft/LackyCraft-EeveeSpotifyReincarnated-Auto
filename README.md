@@ -3,7 +3,7 @@
 # EeveeSpotifyReincarnated (Auto-Sync Fork)
 
 **Maintainers:** [jaydenjcpy](https://github.com/jaydenjcpy) & [faroukbmiled](https://github.com/faroukbmiled) & [Mod4](https://github.com/M0d-4) <br />
-**Last Update:** `8/02/26` **Spotify Version:** `9.1.68`
+**Last Update:** `8/19/26` **Spotify Version:** `9.1.74`
 
 This tweak makes Spotify think you have a Premium subscription, granting free listening, just like Spotilife, and provides some additional features like custom lyrics.
 
@@ -200,7 +200,9 @@ For sideloaded IPAs, we recommend using **SideStore** or certificate-based signi
 To open Spotify links in sideloaded app, use [OpenSpotifySafariExtension](https://github.com/BillyCurtis/OpenSpotifySafariExtension). Remember to activate it and allow access in Settings > Safari > Extensions.
 
 ## Credits
-Thanks for all of the community's support, also, thanks to all the devs who worked along with me to revive this project Go check the other dev's out:
+Thanks for all of the community's support, also, thanks to all the devs who worked along with us to revive this project Go check the other dev's out:
+
+[jaydenjcpy](https://github.com/jaydenjcpy)
 
 [Ryuk](https://github.com/faroukbmiled)
 
@@ -211,6 +213,8 @@ Thanks for all of the community's support, also, thanks to all the devs who work
 [Skye](https://github.com/Meeep1)
 
 [whoeevee](https://github.com/whoeevee)
+
+- This project is a fork of [Meeep1/EeveeSpotifyRevivedPublic](https://github.com/Meeep1/EeveeSpotifyRevivedPublic).
 
 ## Disclaimer
 
